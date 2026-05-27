@@ -416,15 +416,16 @@ async function loadContactsFromSheet() {
 
 // ── ESCRIBIR ESTADO EN SHEET ─────────────────────────────────
 async function saveStatusToSheet(contactId, newStatus) {
-  if (!accessToken) return;
+  if (!accessToken) { showAuthWarning(); return; }
   try {
+    // Leer IDs para encontrar la fila correcta
     const res = await fetch(`${BASE_URL}/contactos!A4:A500?key=${API_KEY}`);
     const data = await res.json();
     if (!data.values) return;
     const rowIndex = data.values.findIndex(r => parseInt(r[0]) === contactId);
     if (rowIndex === -1) return;
     const sheetRow = rowIndex + 4;
-    await fetch(
+    const writeRes = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/contactos!I${sheetRow}?valueInputOption=RAW`,
       {
         method: 'PUT',
@@ -435,7 +436,43 @@ async function saveStatusToSheet(contactId, newStatus) {
         body: JSON.stringify({ values: [[newStatus]] })
       }
     );
+    if (writeRes.status === 401) {
+      // Token expirado — renovar y reintentar
+      accessToken = null;
+      localStorage.removeItem('bsoc_token');
+      showAuthWarning();
+    } else {
+      showSaveIndicator();
+    }
   } catch(e) { console.error('Error guardando estado:', e); }
+}
+
+function showSaveIndicator() {
+  let ind = document.getElementById('save-ind');
+  if (!ind) {
+    ind = document.createElement('div');
+    ind.id = 'save-ind';
+    ind.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#22c55e;color:#fff;font-size:12px;font-weight:600;padding:8px 16px;border-radius:8px;z-index:9999;transition:opacity 0.5s;';
+    document.body.appendChild(ind);
+  }
+  ind.textContent = '✓ Guardado en Google Sheets';
+  ind.style.opacity = '1';
+  setTimeout(() => { ind.style.opacity = '0'; }, 2500);
+}
+
+function showAuthWarning() {
+  let ind = document.getElementById('save-ind');
+  if (!ind) {
+    ind = document.createElement('div');
+    ind.id = 'save-ind';
+    ind.style.cssText = 'position:fixed;bottom:20px;right:20px;font-size:12px;font-weight:600;padding:8px 16px;border-radius:8px;z-index:9999;cursor:pointer;';
+    document.body.appendChild(ind);
+  }
+  ind.style.background = '#ef4444';
+  ind.style.color = '#fff';
+  ind.style.opacity = '1';
+  ind.textContent = '⚠ Sesión expirada — pulsa para volver a entrar';
+  ind.onclick = () => { signOut(); };
 }
 
 // ── GUARDAR NUEVO CONTACTO ───────────────────────────────────
@@ -501,17 +538,45 @@ function showLoadingOverlay(show) {
 
 // ── INIT ─────────────────────────────────────────────────────
 async function initData() {
-  // Intentar cargar con token guardado primero
   const saved = localStorage.getItem('bsoc_token');
   if (saved) {
     accessToken = saved;
-    hideLoginScreen();
-    showLoadingOverlay(true);
-    await loadContactsFromSheet();
-    showLoadingOverlay(false);
+    // Verificar que el token sigue siendo válido
+    const valid = await validateToken();
+    if (valid) {
+      hideLoginScreen();
+      showLoadingOverlay(true);
+      await loadContactsFromSheet();
+      showLoadingOverlay(false);
+    } else {
+      // Token expirado — pedir nuevo silenciosamente
+      accessToken = null;
+      localStorage.removeItem('bsoc_token');
+      hideLoginScreen();
+      showLoadingOverlay(true);
+      await silentSignIn();
+    }
   } else {
     showLoginScreen();
   }
+}
+
+async function validateToken() {
+  try {
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/contactos!A4:A5?key=${API_KEY}`
+    );
+    return res.ok;
+  } catch(e) { return false; }
+}
+
+async function silentSignIn() {
+  return new Promise((resolve) => {
+    if (!tokenClient) { showLoadingOverlay(false); showLoginScreen(); resolve(); return; }
+    tokenClient.requestAccessToken({ prompt: '' });
+    // El callback de tokenClient se encarga del resto
+    resolve();
+  });
 }
 
 // ── DATOS ────────────────────────────────────────────────────
