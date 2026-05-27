@@ -236,6 +236,7 @@
         <option value="declined">No vendrá</option>
       </select>
       <button class="btn btn-yellow btn-sm" onclick="saveEdition()"><i class="ti ti-device-floppy"></i> Guardar edición</button>
+      <button class="btn btn-red btn-sm" onclick="closeAndReset()" style="padding:.5rem 1rem;font-size:12px;" title="Guardar historial y resetear todos los estados a pendiente"><i class="ti ti-refresh-alert"></i> Cerrar edición y resetear</button>
     </div>
     <div id="tracking-table-container"></div>
   </div>
@@ -292,6 +293,43 @@
       <button class="btn btn-outline" onclick="skipContact()">Saltar</button>
       <button class="btn btn-outline" onclick="openMailClient()"><i class="ti ti-external-link"></i> Abrir en cliente de correo</button>
       <button class="btn btn-yellow" onclick="markAsSentAndNext()"><i class="ti ti-check"></i> Enviado — Siguiente</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL RESET -->
+<div class="modal-overlay" id="reset-modal">
+  <div class="modal" style="max-width:500px">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" style="color:var(--red)"><i class="ti ti-alert-triangle" style="margin-right:6px"></i>Cerrar edición y resetear</div>
+        <div class="modal-sub">Esta acción no se puede deshacer</div>
+      </div>
+      <button class="modal-close" onclick="closeResetModal()">×</button>
+    </div>
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);border-radius:8px;padding:1rem;margin-bottom:1.25rem;">
+      <p style="font-size:13px;color:var(--text);line-height:1.6">Se guardarán los resultados actuales en el <strong style="color:var(--yellow)">Historial</strong> y todos los estados del libro seleccionado volverán a <strong style="color:var(--yellow)">Pendiente</strong> en el Google Sheet.<br><br>Usa esto cuando haya terminado un Book Review y quieras preparar el siguiente.</p>
+    </div>
+    <div class="form-group" style="margin-bottom:1rem">
+      <label class="form-label">Nombre de la edición que se va a archivar</label>
+      <input class="form-input" type="text" id="reset-edition-name" placeholder="Ej: Book Review PARCS — Junio 2026">
+    </div>
+    <div class="form-group" style="margin-bottom:1.5rem">
+      <label class="form-label">Programa</label>
+      <select class="form-input" id="reset-edition-program">
+        <option value="parcs_feb">PARCS — Febrero</option>
+        <option value="parcs_jun">PARCS — Junio</option>
+        <option value="integral">Creatividad Integral</option>
+        <option value="eventos">Events & Experiences</option>
+      </select>
+    </div>
+    <div id="reset-progress" style="display:none;margin-bottom:1rem;">
+      <div class="progress-bar"><div class="progress-fill" id="reset-progress-fill" style="width:0%"></div></div>
+      <p id="reset-progress-label" style="font-size:11px;color:var(--muted);margin-top:4px;text-align:center"></p>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end" id="reset-buttons">
+      <button class="btn btn-outline" onclick="closeResetModal()">Cancelar</button>
+      <button class="btn btn-red" onclick="confirmReset()" style="font-size:12px;padding:.5rem 1rem;"><i class="ti ti-refresh-alert"></i> Sí, cerrar y resetear</button>
     </div>
   </div>
 </div>
@@ -972,6 +1010,101 @@ async function reloadContacts() {
   renderStats(); renderTable();
   if (document.getElementById('view-tracking').classList.contains('active')) renderTracking();
   if (btn) { btn.innerHTML = '<i class="ti ti-refresh" style="font-size:13px"></i> Actualizar'; btn.disabled = false; }
+}
+
+// ── CERRAR EDICIÓN Y RESETEAR ────────────────────────────────
+function closeAndReset() {
+  const now = new Date();
+  const prog = trackBook === 'parcs' ? 'parcs_jun' : trackBook;
+  document.getElementById('reset-edition-name').value = `Book Review ${EDITION_LABELS[prog]} ${now.getFullYear()}`;
+  document.getElementById('reset-edition-program').value = prog;
+  document.getElementById('reset-progress').style.display = 'none';
+  document.getElementById('reset-buttons').style.display = 'flex';
+  document.getElementById('reset-modal').classList.add('open');
+}
+
+function closeResetModal() {
+  document.getElementById('reset-modal').classList.remove('open');
+}
+
+async function confirmReset() {
+  const name = document.getElementById('reset-edition-name').value.trim();
+  if (!name) { alert('Pon un nombre a la edición antes de continuar'); return; }
+  if (!accessToken) { showAuthWarning(); return; }
+
+  // Hide buttons, show progress
+  document.getElementById('reset-buttons').style.display = 'none';
+  document.getElementById('reset-progress').style.display = 'block';
+  const fill = document.getElementById('reset-progress-fill');
+  const label = document.getElementById('reset-progress-label');
+
+  // Step 1: Save to historial
+  label.textContent = 'Guardando historial...';
+  fill.style.width = '20%';
+
+  const list = contacts.filter(c => c.lists.includes(trackBook));
+  const edition = {
+    id: Date.now(),
+    name,
+    program: document.getElementById('reset-edition-program').value,
+    year: new Date().getFullYear(),
+    date: new Date().toLocaleDateString('es-ES'),
+    snapshot: list.map(c => ({ nombre:c.nombre, apellido:c.apellido, agency:c.agency, email:c.email, status:c.status }))
+  };
+  savedEditions.unshift(edition);
+  await saveEditionToSheet(edition);
+
+  fill.style.width = '40%';
+  label.textContent = 'Reseteando estados en Google Sheet...';
+
+  // Step 2: Get all row indices for this book
+  try {
+    const res = await fetch(`${BASE_URL}/contactos!A4:J500?key=${API_KEY}`);
+    const data = await res.json();
+    if (!data.values) throw new Error('No data');
+
+    const toReset = data.values
+      .map((r, i) => ({ row: i + 4, id: parseInt(r[0]), lists: (r[7]||'').split(',').map(x=>x.trim()) }))
+      .filter(r => r.lists.includes(trackBook) && !isNaN(r.id));
+
+    let done = 0;
+    for (const item of toReset) {
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/contactos!I${item.row}?valueInputOption=RAW`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` },
+          body: JSON.stringify({ values: [['pending']] })
+        }
+      );
+      done++;
+      fill.style.width = (40 + Math.round(done / toReset.length * 55)) + '%';
+      label.textContent = `Reseteando... ${done} de ${toReset.length}`;
+    }
+
+    // Step 3: Update local contacts
+    contacts.forEach(c => { if (c.lists.includes(trackBook)) c.status = 'pending'; });
+
+    fill.style.width = '100%';
+    label.textContent = '✓ Completado';
+    label.style.color = 'var(--green)';
+
+    setTimeout(() => {
+      closeResetModal();
+      renderTracking();
+      renderStats();
+      renderTable();
+      renderHistory();
+      label.style.color = '';
+      alert(`✓ Edición "${name}" archivada en el Historial. Todos los estados han vuelto a Pendiente.`);
+    }, 1000);
+
+  } catch(e) {
+    console.error('Error en reset:', e);
+    label.textContent = '✗ Error — inténtalo de nuevo';
+    label.style.color = 'var(--red)';
+    document.getElementById('reset-buttons').style.display = 'flex';
+  }
 }
 
 // ── NAVEGACIÓN ───────────────────────────────────────────────
