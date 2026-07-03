@@ -448,7 +448,7 @@ async function loadContactsFromSheet() {
         lists:    (r[7] || 'parcs').split(',').map(x => x.trim()),
         status:   r[8] || 'pending'
       }));
-    nextId = Math.max(...contacts.map(c => c.id)) + 1;
+    nextId = contacts.length ? Math.max(...contacts.map(c => c.id)) + 1 : 1;
   } catch(e) { console.error('Error cargando contactos:', e); }
 }
 
@@ -457,16 +457,16 @@ async function loadHistorialFromSheet() {
   try {
     const res = await fetch(`${BASE_URL}/historial!A2:I200?key=${API_KEY}`);
     const data = await res.json();
-    if (!data.values) return;
-    // Skip header rows (first 2 rows are title + header)
-    const rows = data.values.filter(r => r[0] && !isNaN(r[0]) && r[0] !== '1' || (r[0] && r[1] && r[1] !== 'NOMBRE EDICIÓN'));
-    savedEditions = rows
-      .filter(r => r[0] && r[1] && r[0] !== 'ID')
-      .map(r => {
+    if (!data.values) { savedEditions = []; return; }
+    savedEditions = data.values
+      .map((r, i) => ({ r, row: i + 2 })) // row real en el Sheet (el rango empieza en A2)
+      .filter(({r}) => r[0] && r[1] && r[0] !== 'ID' && r[1] !== 'NOMBRE EDICIÓN')
+      .map(({r, row}) => {
         let snapshot = [];
         try { snapshot = JSON.parse(r[8] || '[]'); } catch(e) { snapshot = []; }
         return {
           id:       parseInt(r[0]) || Date.now(),
+          row:      row,
           name:     r[1] || '',
           program:  r[2] || 'parcs_jun',
           year:     r[3] || new Date().getFullYear(),
@@ -474,7 +474,6 @@ async function loadHistorialFromSheet() {
           snapshot: snapshot
         };
       })
-      .filter(e => e.name && e.name !== 'NOMBRE EDICIÓN' && e.name !== 'Book Review PARCS — Febrero 2026')
       .sort((a, b) => b.id - a.id); // más reciente primero
   } catch(e) { console.error('Error cargando historial:', e); }
 }
@@ -506,10 +505,12 @@ async function saveStatusToSheet(contactId, newStatus) {
       accessToken = null;
       localStorage.removeItem('bsoc_token');
       showAuthWarning();
+    } else if (!writeRes.ok) {
+      showErrorIndicator('Error guardando en Google Sheets');
     } else {
       showSaveIndicator();
     }
-  } catch(e) { console.error('Error guardando estado:', e); }
+  } catch(e) { console.error('Error guardando estado:', e); showErrorIndicator('Error de conexión al guardar'); }
 }
 
 function showSaveIndicator() {
@@ -523,6 +524,22 @@ function showSaveIndicator() {
   ind.textContent = '✓ Guardado en Google Sheets';
   ind.style.opacity = '1';
   setTimeout(() => { ind.style.opacity = '0'; }, 2500);
+}
+
+function showErrorIndicator(msg) {
+  let ind = document.getElementById('save-ind');
+  if (!ind) {
+    ind = document.createElement('div');
+    ind.id = 'save-ind';
+    ind.style.cssText = 'position:fixed;bottom:20px;right:20px;font-size:12px;font-weight:600;padding:8px 16px;border-radius:8px;z-index:9999;transition:opacity 0.5s;';
+    document.body.appendChild(ind);
+  }
+  ind.onclick = null;
+  ind.style.background = '#ef4444';
+  ind.style.color = '#fff';
+  ind.style.opacity = '1';
+  ind.textContent = '⚠ ' + msg;
+  setTimeout(() => { ind.style.opacity = '0'; }, 3500);
 }
 
 function showAuthWarning() {
@@ -562,10 +579,12 @@ async function saveNewContactToSheet(contact) {
 }
 
 // ── GUARDAR EDICIÓN EN HISTORIAL ─────────────────────────────
+// Devuelve true/false según si la escritura en el Sheet tuvo éxito,
+// para que quien llame pueda decidir si es seguro continuar (p.ej. resetear estados).
 async function saveEditionToSheet(edition) {
-  if (!accessToken) return;
+  if (!accessToken) return false;
   try {
-    await fetch(
+    const res = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/historial!A:I:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
       {
         method: 'POST',
@@ -582,7 +601,8 @@ async function saveEditionToSheet(edition) {
         ]] })
       }
     );
-  } catch(e) { console.error('Error guardando historial:', e); }
+    return res.ok;
+  } catch(e) { console.error('Error guardando historial:', e); return false; }
 }
 
 // ── LOADING OVERLAY ──────────────────────────────────────────
@@ -960,19 +980,24 @@ function saveEdition() {
 }
 function closeSaveModal() { document.getElementById('save-modal').classList.remove('open'); }
 
-function confirmSave() {
+async function confirmSave() {
   const name = document.getElementById('edition-name').value.trim();
   if (!name) { alert('Pon un nombre a la edición'); return; }
+  if (!accessToken) { showAuthWarning(); return; }
   const list = contacts.filter(c=>c.lists.includes(trackBook));
-  savedEditions.unshift({
+  const edition = {
     id: Date.now(),
     name,
     program: document.getElementById('edition-program').value,
     year: document.getElementById('edition-year').value,
     date: new Date().toLocaleDateString('es-ES'),
     snapshot: list.map(c=>({nombre:c.nombre,apellido:c.apellido,agency:c.agency,email:c.email,status:c.status}))
-  });
-  closeSaveModal(); saveEditionToSheet(savedEditions[0]); renderHistory();
+  };
+  closeSaveModal();
+  const ok = await saveEditionToSheet(edition);
+  if (!ok) { alert(`✗ No se pudo guardar la edición "${name}" en Google Sheets. Revisa tu conexión y vuelve a intentarlo.`); return; }
+  await loadHistorialFromSheet();
+  renderHistory();
   alert(`✓ Edición "${name}" guardada en el historial.`);
 }
 
@@ -1010,8 +1035,17 @@ function renderHistory() {
   }).join('');
 }
 
-function deleteEdition(id) {
-  if (!confirm('¿Eliminar esta edición del historial?')) return;
+async function deleteEdition(id) {
+  if (!confirm('¿Eliminar esta edición del historial? También se borrará de Google Sheets.')) return;
+  const ed = savedEditions.find(e=>e.id===id);
+  if (ed && ed.row && accessToken) {
+    try {
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/historial!A${ed.row}:I${ed.row}:clear`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` }, body: '{}' }
+      );
+    } catch(e) { console.error('Error borrando edición en Sheets:', e); showErrorIndicator('No se pudo borrar en Google Sheets'); }
+  }
   savedEditions = savedEditions.filter(e=>e.id!==id);
   renderHistory();
 }
@@ -1080,8 +1114,15 @@ async function confirmReset() {
     date: new Date().toLocaleDateString('es-ES'),
     snapshot: list.map(c => ({ nombre:c.nombre, apellido:c.apellido, agency:c.agency, email:c.email, status:c.status }))
   };
-  savedEditions.unshift(edition);
-  await saveEditionToSheet(edition);
+  const historialSaved = await saveEditionToSheet(edition);
+  if (!historialSaved) {
+    // No reseteamos nada si no pudimos archivar primero: perder el historial sería peor.
+    label.textContent = '✗ No se pudo guardar el historial — nada se ha reseteado. Revisa tu conexión e inténtalo de nuevo.';
+    label.style.color = 'var(--red)';
+    document.getElementById('reset-buttons').style.display = 'flex';
+    return;
+  }
+  await loadHistorialFromSheet();
 
   fill.style.width = '40%';
   label.textContent = 'Reseteando estados en Google Sheet...';
@@ -1097,26 +1138,39 @@ async function confirmReset() {
       .filter(r => r.lists.includes(trackBook) && !isNaN(r.id));
 
     let done = 0;
+    const failedIds = [];
     for (const item of toReset) {
-      await fetch(
-        `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/contactos!I${item.row}?valueInputOption=RAW`,
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` },
-          body: JSON.stringify({ values: [['pending']] })
-        }
-      );
+      let ok = false;
+      for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+        try {
+          const writeRes = await fetch(
+            `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/contactos!I${item.row}?valueInputOption=RAW`,
+            {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` },
+              body: JSON.stringify({ values: [['pending']] })
+            }
+          );
+          ok = writeRes.ok;
+        } catch(e) { ok = false; }
+      }
+      if (!ok) failedIds.push(item.id);
       done++;
       fill.style.width = (40 + Math.round(done / toReset.length * 55)) + '%';
       label.textContent = `Reseteando... ${done} de ${toReset.length}`;
     }
 
-    // Step 3: Update local contacts
-    contacts.forEach(c => { if (c.lists.includes(trackBook)) c.status = 'pending'; });
+    // Step 3: Update local contacts — solo los que realmente se resetearon en el Sheet
+    contacts.forEach(c => { if (c.lists.includes(trackBook) && !failedIds.includes(c.id)) c.status = 'pending'; });
 
     fill.style.width = '100%';
-    label.textContent = '✓ Completado';
-    label.style.color = 'var(--green)';
+    if (failedIds.length) {
+      label.textContent = `⚠ ${failedIds.length} contacto(s) no se pudieron resetear`;
+      label.style.color = 'var(--red)';
+    } else {
+      label.textContent = '✓ Completado';
+      label.style.color = 'var(--green)';
+    }
 
     setTimeout(() => {
       closeResetModal();
@@ -1125,12 +1179,16 @@ async function confirmReset() {
       renderTable();
       renderHistory();
       label.style.color = '';
-      alert(`✓ Edición "${name}" archivada en el Historial. Todos los estados han vuelto a Pendiente.`);
+      if (failedIds.length) {
+        alert(`Edición "${name}" archivada en el Historial.\n\n⚠ Atención: ${failedIds.length} contacto(s) no se pudieron resetear en el Google Sheet (posible caducidad de sesión o fallo de red). Vuelve a pulsar "Cerrar edición y resetear" para terminar de limpiarlos — no se duplicará el historial si cancelas antes, pero si confirmas de nuevo se archivará una segunda vez.`);
+      } else {
+        alert(`✓ Edición "${name}" archivada en el Historial. Todos los estados han vuelto a Pendiente.`);
+      }
     }, 1000);
 
   } catch(e) {
     console.error('Error en reset:', e);
-    label.textContent = '✗ Error — inténtalo de nuevo';
+    label.textContent = '✗ Error — el historial ya se guardó, pero el reseteo falló. Inténtalo de nuevo.';
     label.style.color = 'var(--red)';
     document.getElementById('reset-buttons').style.display = 'flex';
   }
